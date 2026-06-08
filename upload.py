@@ -164,9 +164,15 @@ limiter = RateLimiter(1/150)
 def normalize_id(id_str, category="refine"):
     if not id_str: return id_str
     if "@" in id_str: return id_str
-    if category == "refine" or category == "rock":
+    
+    # Updated: Include all refined resource types so they all get the correct API format
+    refined_categories = ["hide", "rock", "fiber", "wood", "ore", "refine"]
+    
+    if category.lower() in refined_categories:
+        # Keeps _LEVEL1 and adds @1 resulting in T4_ROCK_LEVEL1@1
         return re.sub(r"_LEVEL(\d+)", r"\g<0>@\1", id_str)
     else:
+        # Fallback for non-refined items (Potions/Food)
         return re.sub(r"_LEVEL(\d+)", r"@\1", id_str)
 
 def get_base_name(id_str):
