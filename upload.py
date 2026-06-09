@@ -57,6 +57,7 @@ def reset_defaults():
     st.session_state['show_avg_price'] = False
     st.session_state['show_profit'] = False
     st.session_state['show_rrr'] = False
+    st.session_state['show_station_cost'] = False
 
 # ================= PAGE CONFIG & STYLING ================= 
 st.set_page_config(layout="wide", page_title="Albion Crafting Calculator") 
@@ -107,9 +108,11 @@ st.sidebar.markdown("## Config")
 ALL_CITIES = ["Bridgewatch", "Lymhurst", "Martlock", "Fort Sterling", "Thetford", "Caerleon", "Black Market", "Brecilien"]
 
 with st.sidebar.expander("General Settings", expanded=True):
-    ui_choice = st.selectbox("Craft Type", ["Potions", "Food", "Refining"], key="craft_type")
+    ui_choice = st.selectbox("Craft Type", ["Potions", "Food", "Refining", "Mounts", "Capes"], key="craft_type")
     if ui_choice == "Potions": CRAFT_TYPE = "potion"
     elif ui_choice == "Refining": CRAFT_TYPE = "refine"
+    elif ui_choice == "Mounts": CRAFT_TYPE = "mount"
+    elif ui_choice == "Capes": CRAFT_TYPE = "cape"
     else: CRAFT_TYPE = "food"
 
     CRAFT_CITIES = st.multiselect("Craft City", [c for c in ALL_CITIES if c != "Black Market"], default=["Bridgewatch"], key="craft_cities") 
@@ -134,6 +137,7 @@ with st.sidebar.expander("Display Options"):
     SHOW_AVG_PRICE = st.checkbox("Show Avg Price (24h)", value=False, key="show_avg_price") 
     SHOW_PROFIT = st.checkbox("Show Profit (Silver)", value=False, key="show_profit") 
     SHOW_RRR = st.checkbox("Show Return Rate", value=False, key="show_rrr")
+    SHOW_STATION_COST = st.checkbox("Show Station Cost", value=False, key="show_station_cost")
 
 st.sidebar.button("Restore Default Settings", on_click=reset_defaults, use_container_width=True)
 
@@ -164,17 +168,14 @@ def normalize_id(id_str):
     if not id_str: return id_str
     if "@" in id_str: return id_str
     
-    # FIX: Exclude special enchantment materials that actually keep the _LEVEL prefix in the API
     ignore_kws = ["FISHSAUCE", "EXTRACT"]
     if any(kw in id_str for kw in ignore_kws):
         return id_str
     
-    # Both raw and refined resources use the _LEVELX@X format in the API
     resource_kws = ["_WOOD", "_PLANKS", "_ORE", "_METALBAR", "_FIBER", "_CLOTH", "_HIDE", "_LEATHER", "_ROCK", "_STONEBLOCK"]
     if any(kw in id_str for kw in resource_kws):
         return re.sub(r"_LEVEL(\d+)", r"\g<0>@\1", id_str)
     else:
-        # Gear, weapons, food, and potions drop the _LEVEL prefix
         return re.sub(r"_LEVEL(\d+)", r"@\1", id_str)
 
 def get_id(r):
@@ -201,7 +202,6 @@ def get_hours_ago(date_str):
     if not date_str or date_str == "N/A" or date_str.startswith("0001-01-01"): 
         return 999 
     try: 
-        # Strip trailing 'Z' and fractional seconds
         clean_date = date_str.split('.')[0].replace("Z", "")
         dt = datetime.strptime(clean_date, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) 
         diff = datetime.now(timezone.utc) - dt 
@@ -214,25 +214,18 @@ def format_age(hours):
     return f"{hours}h"
 
 def get_active_price(item_data, max_age):
-    """
-    Safely determines whether to use live or historical price based on MAX_AGE.
-    Returns (price_to_use, actual_age_of_that_price)
-    """
     live_price = item_data.get('price', 0)
     live_age = get_hours_ago(item_data.get('date', 'N/A'))
     
     hist_price = item_data.get('hist_price', 0)
     hist_age = get_hours_ago(item_data.get('hist_date', 'N/A'))
 
-    # Prefer live price if valid and within max_age
     if live_price > 0 and live_age <= max_age:
         return live_price, live_age
         
-    # Fallback to history if live is stale or missing
     if hist_price > 0 and hist_age <= max_age:
         return hist_price, hist_age
         
-    # If both are stale/missing, return whichever is newer (will likely be filtered out later)
     if live_age <= hist_age:
         return live_price, live_age
     return hist_price, hist_age
@@ -244,7 +237,6 @@ def fetch_market_data(ids):
     all_cities = list(set(CRAFT_CITIES + SELL_CITIES))
     city_param = ",".join(all_cities) 
       
-    # --- 1. FETCH LIVE PRICES ---
     for i in range(0, len(unique_ids), BATCH_SIZE): 
         limiter.wait() 
         chunk = unique_ids[i : i + BATCH_SIZE] 
@@ -263,11 +255,9 @@ def fetch_market_data(ids):
                         data_map[item_id][city].update({'price': price, 'date': row.get('sell_price_min_date', 'N/A')}) 
         except: continue 
       
-    # --- 2. FETCH HISTORY ---
     for i in range(0, len(unique_ids), HIST_BATCH_SIZE): 
         limiter.wait() 
         chunk = unique_ids[i : i + HIST_BATCH_SIZE] 
-        # FIX: Removed the erroneous ".json" that broke multi-item batching
         url = f"{HISTORY_URL}{','.join(chunk)}?locations={city_param}&time-scale=24" 
         try: 
             r = requests.get(url, timeout=30) 
@@ -292,7 +282,7 @@ def fetch_market_data(ids):
                             update_dict = {
                                 'volume': int(avg_vol), 
                                 'hist_price': most_recent.get("avg_price", 0),
-                                'hist_date': most_recent.get("timestamp", 'N/A') # FIX: Explicitly track history age
+                                'hist_date': most_recent.get("timestamp", 'N/A')
                             } 
                             data_map[item_id][city].update(update_dict) 
         except: continue 
@@ -308,25 +298,31 @@ def process_recipe(r, name_map, market_data):
         for sell_city in SELL_CITIES:
             is_refining = (CRAFT_TYPE == "refine")
             
-            # Dynamic Return Rate Calculation
+            # Get returns for both scenarios to calculate marginal S/F profit
             current_return = get_rrr(craft_city, r.get("category", ""), USE_FOCUS, is_refining)
+            no_focus_return = get_rrr(craft_city, r.get("category", ""), False, is_refining)
             
             out_key = r['output']
             out_data = market_data.get(out_key, {}).get(sell_city, {}) 
             
-            # FIX: Safely retrieve active price and its correct corresponding age
             revenue, out_hours = get_active_price(out_data, MAX_AGE)
             
             total_mat_cost = 0.0 
+            total_mat_cost_no_focus = 0.0
             max_mat_hours = 0 
+            
             for i in r['inputs']: 
                 mat_id = i['id'] 
                 mat_data = market_data.get(mat_id, {}).get(craft_city, {}) 
                 price, mat_hours = get_active_price(mat_data, MAX_AGE)
                 
                 max_mat_hours = max(max_mat_hours, mat_hours) 
+                
                 modifier = 1.0 if i.get('ignore_return') else (1 - current_return) 
+                modifier_no_focus = 1.0 if i.get('ignore_return') else (1 - no_focus_return)
+                
                 total_mat_cost += (price * i['count'] * modifier) 
+                total_mat_cost_no_focus += (price * i['count'] * modifier_no_focus)
             
             if out_hours > MAX_AGE or max_mat_hours > MAX_AGE: continue 
             
@@ -334,6 +330,7 @@ def process_recipe(r, name_map, market_data):
             total_cost = total_mat_cost + r.get("silver_cost", 0) + station_fee 
             gross_rev = (revenue * r.get("yield", 1) * (1 - MARKET_TAX)) 
             avg_rev = (out_data.get('hist_price', 0) * r.get("yield", 1) * (1 - MARKET_TAX))
+            
             profit = gross_rev - total_cost 
             pct = (profit / total_cost * 100) if total_cost > 0 else 0 
             
@@ -342,7 +339,21 @@ def process_recipe(r, name_map, market_data):
             
             if profit > best_profit: 
                 best_profit = profit 
-                focus_cost = int(r.get("focus_cost", 0) * (0.5 ** (FOCUS_EFFICIENCY / 10000))) 
+                
+                # --- S/F CALCULATION LOGIC FIX ---
+                # Taking yield crafted into account for total batch focus
+                base_batch_focus = r.get("focus_cost", 0) * r.get("yield", 1)
+                focus_cost = int(base_batch_focus * (0.5 ** (FOCUS_EFFICIENCY / 10000))) 
+                
+                # Calculate the extra silver saved entirely due to focus
+                extra_profit = total_mat_cost_no_focus - total_mat_cost
+                
+                # Update: Only award S/F if the item actually has a sell price
+                if revenue > 0 and USE_FOCUS and focus_cost > 0:
+                    sf_value = int(extra_profit / focus_cost)
+                else:
+                    sf_value = 0
+                # ---------------------------------
                 
                 out_tier = get_tier(r['output'])
                 out_name = name_map.get(get_base_name(r['output']), r['output'])
@@ -359,9 +370,9 @@ def process_recipe(r, name_map, market_data):
                 best_result = { 
                     "Craft City": craft_city, "Sell City": sell_city, "Tier": out_tier, "Name": out_name, 
                     "Inputs": r['inputs'], "Mat Cost": int(total_cost), "Sell Price": int(gross_rev), "Avg Price (24h)": int(avg_rev),
-                    "Profit Margin%": round(pct, 1), "Profit (Silver)": int(profit), "S/F": int(profit / focus_cost) if (USE_FOCUS and focus_cost > 0) else 0, 
+                    "Profit Margin%": round(pct, 1), "Profit (Silver)": int(profit), "S/F": sf_value, 
                     "Focus": focus_cost, "Vol Sold (24h)": out_data.get('volume', 0), "Item Age": format_age(out_hours), "Mat Age": format_age(max_mat_hours),
-                    "Return Rate": f"{current_return:.1%}"
+                    "Return Rate": f"{current_return:.1%}", "Station Cost": int(station_fee)
                 } 
     return best_result 
 
@@ -399,6 +410,15 @@ if st.button("Click to Calculate", use_container_width=True):
     recipes = [] 
     name_map = {} 
     
+    # --- STATION COST FIX: Create a global dict to hold all item values for fallback ---
+    item_value_dict = {}
+    for cat, items_list in root.items():
+        if isinstance(items_list, list):
+            for itm in items_list:
+                if isinstance(itm, dict) and "@uniquename" in itm:
+                    item_value_dict[itm["@uniquename"]] = float(itm.get("@itemvalue", 0))
+    # -----------------------------------------------------------------------------------
+    
     for cat, items in root.items(): 
         if not isinstance(items, list): continue 
         for item in items: 
@@ -410,7 +430,17 @@ if st.button("Click to Calculate", use_container_width=True):
             
             cat_tag = item.get("@craftingcategory", "").lower()
             subcat = item.get("@shopsubcategory1", "").lower()
-            is_match = (subcat == "refinedresources") if CRAFT_TYPE == "refine" else (cat_tag == CRAFT_TYPE)
+            slottype = item.get("@slottype", "").lower()
+            
+            if CRAFT_TYPE == "refine":
+                is_match = (subcat == "refinedresources")
+            elif CRAFT_TYPE == "mount":
+                is_match = (slottype == "mount")
+            elif CRAFT_TYPE == "cape":
+                is_match = (slottype == "cape")
+            else:
+                is_match = (cat_tag == CRAFT_TYPE)
+            
             if not is_match: continue
             
             tier_match = re.match(r"T([1-8])_", u_name) 
@@ -425,14 +455,39 @@ if st.button("Click to Calculate", use_container_width=True):
                     for r in raw_res:
                         if "FACTION" in get_id(r).upper(): return 
 
-                inputs = [{"id": get_id(r), "count": int(r.get("@count", 1)), "ignore_return": r.get("@maxreturnamount") == "0"} for r in raw_res if get_id(r)] 
+                # --- SPECIAL CAPE FIX: Extract enchantment level to apply to base materials ---
+                lvl_match = re.search(r"_LEVEL(\d+)", output)
+                lvl = lvl_match.group(1) if lvl_match else None
+
+                inputs = []
+                for r in raw_res:
+                    in_id = get_id(r)
+                    if not in_id: continue
+                    
+                    # Fix: Enforce correct enchanted base cape material for special capes
+                    if lvl and re.match(r"^T\d+_CAPE$", in_id):
+                        in_id = f"{in_id}@{lvl}"
+                        
+                    inputs.append({
+                        "id": in_id, 
+                        "count": int(r.get("@count", 1)), 
+                        "ignore_return": r.get("@maxreturnamount") == "0"
+                    })
+                # ------------------------------------------------------------------------------
+                
+                # --- STATION COST FIX: Dynamically calculate missing Item Value from inputs ---
+                if val == 0 and inputs:
+                    total_batch_value = sum(item_value_dict.get(inp["id"], 0) * inp["count"] for inp in inputs)
+                    val = total_batch_value / int(c.get("@amountcrafted", 1)) if int(c.get("@amountcrafted", 1)) > 0 else 0
+                # ------------------------------------------------------------------------------
+
                 if inputs: 
                     recipes.append({"output": normalize_id(output), "category": category, "inputs": inputs, "silver_cost": int(c.get("@silver", 0)), "yield": int(c.get("@amountcrafted", 1)), "focus_cost": int(c.get("@craftingfocus", 0)), "item_value": val}) 
 
             for c in reqs: 
                 if c: add_recipe(c, u_name, base_val, cat_tag) 
             enchant = item.get("enchantments") 
-            if enchant: 
+            if enchant and CRAFT_TYPE != "mount": 
                 for ench in to_list(enchant.get("enchantment")): 
                     lvl = int(ench.get("@enchantmentlevel", 0)) 
                     ench_output = f"{u_name}_LEVEL{lvl}" 
@@ -465,6 +520,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
     if SHOW_ITEM_AGE: cols.append("Item Age")
     if SHOW_MAT_AGE: cols.append("Mat Age")
     if SHOW_RRR: cols.append("Return Rate") 
+    if SHOW_STATION_COST: cols.append("Station Cost")
     
     display_df = df[cols].copy()
     sort_col = "S/F" if USE_FOCUS else "Profit Margin%"
@@ -486,6 +542,7 @@ if st.session_state.df is not None and not st.session_state.df.empty:
         "Item Age": st.column_config.TextColumn("Item Age", alignment="center"),
         "Mat Age": st.column_config.TextColumn("Mat Age", alignment="center"),
         "Return Rate": st.column_config.TextColumn("Return Rate", alignment="center"),
+        "Station Cost": st.column_config.NumberColumn("Station Cost", format="%,d", alignment="center"),
     }
     
     num_rows = len(display_df)
